@@ -4,6 +4,10 @@
 Requires WSL with any Ubuntu/Debian-style distro (auto-detected: Ubuntu, Ubuntu-24.04, Ubuntu-26.04, Debian, ...).
 Outputs: build/vendor-virgl.erofs and prepared/base-virgl.qcow2 (backed by prepared/base.qcow2).
 """
+# Modified from upstream ArtemPozharov/gbos-win-whpx (Apache License 2.0, Sec. 4(b)):
+# Added VIRGL_RECIPE = 6 smoothness optimizations — disable SurfaceFlinger Kawase blurs
+# and GPU stats overhead, raise GenericMouse.idc cursor bounds to 3840x2160, and
+# disable/stop missing-hardware QEMU crash-looping vendor/system daemons.
 import argparse
 import os
 import pathlib
@@ -33,7 +37,8 @@ MESA_LIBS = [
 # 3: bundled plat_file_contexts.zlib (fixes Ubuntu 24.04 fsck.erofs --offset), SetupWizard partner provider kept.
 # 4: unblock ADB over TCP (ro.vendor.adbd.unsafe=1) & enable fast DNS.
 # 5: fix Settings Bluetooth NPE crash by keeping BluetoothAdapter non-null.
-VIRGL_RECIPE = 5
+# 6: disable Kawase blurs & GPU stats overhead, raise GenericMouse.idc clamp to 3840x2160, disable missing-hardware QEMU crash-loopers.
+VIRGL_RECIPE = 6
 
 # Utility distros that cannot run apt-get / mkfs.erofs.
 _SKIP_DISTROS = ('docker-desktop', 'rancher-desktop', 'podman')
@@ -192,8 +197,17 @@ sed -i -e '/^ro\\.hardware\\.vulkan=/d' \\
        -e 's/^debug\\.renderengine\\.graphite_desktop_optin=.*/debug.renderengine.graphite_desktop_optin=false/' \\
        -e 's/^ro\\.surface_flinger\\.has_wide_color_display=.*/ro.surface_flinger.has_wide_color_display=false/' \\
        -e 's/^ro\\.surface_flinger\\.has_HDR_display=.*/ro.surface_flinger.has_HDR_display=false/' \\
+       -e 's/^ro\\.surface_flinger\\.supports_background_blur=.*/ro.surface_flinger.supports_background_blur=0/' \\
+       -e 's/^debug\\.sf\\.renderengine_gpu_stats=.*/debug.sf.renderengine_gpu_stats=false/' \\
        {q_stage}/build.prop
 ! grep -q '^ro.hardware.vulkan=' {q_stage}/build.prop
+grep -q '^ro.surface_flinger.supports_background_blur=0' {q_stage}/build.prop
+grep -q '^persist\\.sys\\.sf\\.disable_blurs=' {q_stage}/build.prop || echo 'persist.sys.sf.disable_blurs=1' >> {q_stage}/build.prop
+if [ -f {q_stage}/usr/idc/GenericMouse.idc ]; then
+  sed -i -e 's/^cursor\\.maxX[[:space:]]*=.*/cursor.maxX = 3840/' \\
+         -e 's/^cursor\\.maxY[[:space:]]*=.*/cursor.maxY = 2160/' \\
+         {q_stage}/usr/idc/GenericMouse.idc
+fi
 # QEMU has no Bluetooth HCI: disable the HAL and the feature, so com.google.android.bluetooth doesn't crash-loop.
 # (Files are overwritten rather than deleted: /oem/init.gbrunch-vm.rc bind-mounts over the same paths.)
 rm -f {q_stage}/etc/init/bluetooth-service-desktop.rc
@@ -201,6 +215,35 @@ printf '<manifest version="9.0" type="device"/>\\n' > {q_stage}/etc/vintf/manife
 cat > {q_stage}/etc/permissions/android.hardware.bluetooth.xml <<'GBXML'
 {NO_BLUETOOTH_XML}GBXML
 cp {q_stage}/etc/permissions/android.hardware.bluetooth.xml {q_stage}/etc/permissions/android.hardware.bluetooth_le.xml
+# QEMU has no Lenovo EC, USB camera, or hardware suspend controller: disable crash-looping daemons.
+rm -f {q_stage}/etc/init/suspend_diagnostics.rc \\
+      {q_stage}/etc/init/suspend_notification_service.rc \\
+      {q_stage}/etc/init/storage_metrics_service.rc \\
+      {q_stage}/etc/init/hal_desktop_charge_control_default.rc \\
+      {q_stage}/etc/init/android.hardware.camera.provider@2.7-service-legacy-wrapper.rc \\
+      {q_stage}/etc/init/android.hardware.camera.provider-usb-service.android-desktop.rc
+for x in \\
+  com.android.desktop.power.suspend_notification_service.xml \\
+  com.android.desktop.power.charge_control.xml \\
+  android.hardware.camera.provider@2.7-service-legacy-wrapper.xml \\
+  android.hardware.camera.provider-usb-service.android-desktop.xml; do
+  if [ -f "{q_stage}/etc/vintf/manifest/$x" ]; then
+    printf '<manifest version="9.0" type="device"/>\\n' > "{q_stage}/etc/vintf/manifest/$x"
+  fi
+done
+# Stop /system daemons that poll missing Titan/GSC & EC hardware (udsattestation, timberslide).
+if [ -f {q_stage}/etc/init/init.ruby.rc ]; then
+  cat >> {q_stage}/etc/init/init.ruby.rc <<'GBVM'
+
+on boot
+    stop udsattestation
+    stop timberslide
+
+on property:sys.boot_completed=1
+    stop udsattestation
+    stop timberslide
+GBVM
+fi
 rm -f /root/vendor-virgl.erofs
 mkfs.erofs -zlz4hc,12 -C65536 -T1230768000 --mount-point=/vendor \\
   --file-contexts=/root/file_contexts.all /root/vendor-virgl.erofs {q_stage} >/root/mkfs.log 2>&1 || (tail -20 /root/mkfs.log; exit 1)
