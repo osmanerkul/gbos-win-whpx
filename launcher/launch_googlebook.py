@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Hardware-accelerated Windows WHPX launcher for Googlebook OS (Android 17) on x86_64 / AMD & Intel."""
+# Modified from upstream ArtemPozharov/gbos-win-whpx (Apache License 2.0, Sec. 4(b)):
+# Added low-latency launcher defaults and options: --input virtio|tablet|usb (usb-kbd +
+# direct PCI virtio-mouse-pci / virtio-tablet-pci), --gpu-hostmem-mb (1024 MiB default),
+# quiet UART serial console default (--verbose-console to override), writeback/unmap
+# qcow2 caching, and Windows ABOVE_NORMAL_PRIORITY_CLASS (--high-priority).
 import argparse
 import ctypes
 import datetime
@@ -198,7 +203,18 @@ def load_manifest(manifest_path: Path):
     return manifest_path, assets, cmdline
 
 
-def wait_with_boot_monitor(proc: subprocess.Popen, serial_log: Path, qemu_log: Path) -> int:
+def filter_quiet_cmdline(cmdline: str) -> str:
+    """Reduce synchronous 8250 UART console logging to prevent WHPX I/O VM-exit micro-stutters."""
+    drop = {'earlycon=uart8250,io,0x3f8,115200', 'ignore_loglevel', 'printk.devkmsg=on'}
+    remap = {
+        'loglevel=8': 'loglevel=4',
+        'androidboot.init_log_level=debug': 'androidboot.init_log_level=3',
+    }
+    return ' '.join(remap.get(tok, tok) for tok in cmdline.split() if tok not in drop)
+
+
+def wait_with_boot_monitor(proc: subprocess.Popen, serial_log: Path, qemu_log: Path,
+                           quiet_console: bool = False) -> int:
     """Monitor early boot progress in serial.log so users aren't left guessing during 'Display output is not active'."""
     print('  [boot] Starting VM... Note: QEMU shows "Display output is not active" for ~20-45s', flush=True)
     print('         during initial boot (especially on first boot while formatting /data).', flush=True)
@@ -256,7 +272,7 @@ def wait_with_boot_monitor(proc: subprocess.Popen, serial_log: Path, qemu_log: P
                     for line in tail_txt.splitlines():
                         if any(k in line for k in ('traps:', 'Kernel panic', 'RIP:', 'Call Trace:')):
                             print(f'    {line}', flush=True)
-            elif elapsed >= 15.0 and not warned_no_serial:
+            elif not quiet_console and elapsed >= 15.0 and not warned_no_serial:
                 warned_no_serial = True
                 print('\n  [WARN] No guest kernel serial output after 15s (WHPX vCPU may be stalled).', flush=True)
                 if qemu_log.is_file():
@@ -294,6 +310,15 @@ def main() -> int:
     parser.add_argument('--adb-port', type=int, default=5555,
                         help='Host port forwarded to guest ADB over TCP (default: 5555; pass 0 to disable)')
     parser.add_argument('--no-audio', action='store_true', help='Disable DirectSound USB audio')
+    parser.add_argument('--input', choices=['virtio', 'tablet', 'usb'], default='virtio',
+                        help='Input device transport: virtio (USB kbd + direct PCI virtio-mouse-pci), '
+                             'tablet (USB kbd + absolute PCI virtio-tablet-pci), or usb (legacy USB kbd + USB mouse)')
+    parser.add_argument('--gpu-hostmem-mb', type=int, default=1024,
+                        help='VirGL max_hostmem allocation in MiB (default: 1024)')
+    parser.add_argument('--verbose-console', action='store_true',
+                        help='Keep verbose UART earlycon/loglevel=8 serial logging (adds WHPX I/O overhead)')
+    parser.add_argument('--high-priority', action=argparse.BooleanOptionalAction, default=True,
+                        help='Run QEMU at ABOVE_NORMAL_PRIORITY_CLASS on Windows (default: True)')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
@@ -301,6 +326,9 @@ def main() -> int:
     width, height = int(width_s), int(height_s)
 
     manifest_path, assets, cmdline = load_manifest(args.manifest)
+    quiet_console = not args.verbose_console
+    if quiet_console:
+        cmdline = filter_quiet_cmdline(cmdline)
     qemu, qemu_img = find_qemu_binaries(args.qemu)
 
     virgl = args.gpu == 'virgl'
@@ -319,7 +347,7 @@ def main() -> int:
                 parser.error(f'{base_disk} build failed; see output above.')
     if args.ephemeral:
         disk = base_disk
-        drive_spec = f'if=none,id=os,format=qcow2,file={str(disk).replace(",", ",,")},snapshot=on'
+        drive_spec = f'if=none,id=os,format=qcow2,file={str(disk).replace(",", ",,")},snapshot=on,cache=writeback,discard=unmap'
     else:
         if (not userdata.exists() or userdata.stat().st_size == 0) and not args.dry_run:
             subprocess.run([
@@ -327,15 +355,18 @@ def main() -> int:
                 '-b', str(base_disk), str(userdata)
             ], check=True)
         disk = userdata
-        drive_spec = f'if=none,id=os,format=qcow2,file={str(disk).replace(",", ",,")}'
+        drive_spec = f'if=none,id=os,format=qcow2,file={str(disk).replace(",", ",,")},cache=writeback,discard=unmap'
 
     run_name = 'run-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     session = manifest_path.parent / 'logs' / run_name
     serial_log = session / 'serial.log'
 
     # virgl: addr=02.0 is required, the vendor sepolicy only labels that PCI slot as sysfs_gpu (default 01.0 -> EGL init denied).
-    gpu_device = (f'virtio-gpu-gl-pci,xres={width},yres={height},edid=off,romfile=,addr=02.0' if virgl
-                  else f'virtio-gpu-pci,xres={width},yres={height},edid=off,romfile=')
+    gpu_hostmem_bytes = max(256, args.gpu_hostmem_mb) * 1024 * 1024
+    gpu_device = (
+        f'virtio-gpu-gl-pci,xres={width},yres={height},edid=off,romfile=,addr=02.0,max_hostmem={gpu_hostmem_bytes}'
+        if virgl else f'virtio-gpu-pci,xres={width},yres={height},edid=off,romfile='
+    )
 
     cmd = [str(qemu)]
     share_dir = qemu.parent / 'share'
@@ -353,9 +384,6 @@ def main() -> int:
         '-device', gpu_device,
         '-drive', drive_spec,
         '-device', 'virtio-blk-pci,drive=os,addr=03.0',
-        '-device', 'qemu-xhci,id=xhci',
-        '-device', 'usb-kbd,bus=xhci.0',
-        '-device', 'usb-mouse,bus=xhci.0',
         '-monitor', 'none',
         '-no-reboot',
         '-kernel', str(assets['kernel']),
@@ -363,6 +391,17 @@ def main() -> int:
         '-append', cmdline,
         '-serial', f'file:{str(serial_log).replace(",", ",,")}',
     ]
+
+    cmd += [
+        '-device', 'qemu-xhci,id=xhci',
+        '-device', 'usb-kbd,bus=xhci.0',
+    ]
+    if args.input == 'virtio':
+        cmd += ['-device', 'virtio-mouse-pci,addr=07.0']
+    elif args.input == 'tablet':
+        cmd += ['-device', 'virtio-tablet-pci,addr=07.0']
+    else:
+        cmd += ['-device', 'usb-mouse,bus=xhci.0']
 
     if args.offline:
         cmd += ['-nic', 'none']
@@ -409,7 +448,9 @@ def main() -> int:
     print('================================================================')
     print(f'  QEMU       : {qemu_ver_str}')
     print(f'  Resolution : {width}x{height} ({"fullscreen" if args.fullscreen else "windowed"})')
-    print(f'  RAM / CPUs : {args.memory_mb} MiB / {args.cpus} vCPUs (50% host auto)')
+    print(f'  RAM / CPUs : {args.memory_mb} MiB / {args.cpus} vCPUs')
+    print(f'  GPU / Input: {args.gpu}' + (f' (hostmem={args.gpu_hostmem_mb} MiB)' if virgl else '') + f' / {args.input}')
+    print(f'  Console    : {"verbose UART" if args.verbose_console else "quiet (low WHPX I/O overhead)"}')
     print(f'  User data  : {disk}')
     if not args.offline and args.adb_port and args.adb_port > 0:
         print(f'  ADB TCP    : localhost:{args.adb_port} -> guest:5555 (adb connect localhost:{args.adb_port})')
@@ -423,11 +464,15 @@ def main() -> int:
         print(f'  [WARN] Detected older QEMU {qemu_major}.x. QEMU 10.0+ is strongly recommended for WHPX')
         print('         (run: winget upgrade SoftwareFreedomConservancy.QEMU)')
 
+    creationflags = (
+        getattr(subprocess, 'ABOVE_NORMAL_PRIORITY_CLASS', 0x00008000)
+        if (sys.platform == 'win32' and args.high_priority) else 0
+    )
     qemu_log = session / 'qemu.log'
     with qemu_log.open('wb') as qlog:
-        proc = subprocess.Popen(cmd, stdout=qlog, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdout=qlog, stderr=subprocess.STDOUT, creationflags=creationflags)
         try:
-            rc = wait_with_boot_monitor(proc, serial_log, qemu_log)
+            rc = wait_with_boot_monitor(proc, serial_log, qemu_log, quiet_console=quiet_console)
         except KeyboardInterrupt:
             proc.terminate()
             rc = proc.wait(timeout=10)
