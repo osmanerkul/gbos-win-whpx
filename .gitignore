@@ -7,6 +7,7 @@ prepared/
 *.img
 *.bin
 *.raw
+*.erofs
 *.zip
 *.tar
 *.iso
