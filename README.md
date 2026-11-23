@@ -261,6 +261,28 @@ python launcher/launch_googlebook.py --gpu virgl
 ```
 
 
+### Smooth VirGL & Low-Latency Tuning (Fork Additions)
+
+For high-resolution VirGL sessions (tested at `2560x1440` on AMD Ryzen 7 7735HS + NVIDIA GeForce RTX 4060 Laptop under Windows 11 WHPX / QEMU 11.1.0), this fork adds [Start-Googlebook-Smooth.bat](Start-Googlebook-Smooth.bat) and `VIRGL_RECIPE = 6`:
+
+```powershell
+# Recommended smooth 1440p VirGL launch (16 GiB RAM, 6 vCPUs, direct PCI mouse, 1 GiB VirGL hostmem)
+.\Start-Googlebook-Smooth.bat --fullscreen
+
+# Zero-capture absolute pointer mode (no Ctrl+Alt+G mouse grab needed)
+.\Start-Googlebook-Smooth.bat --input tablet --fullscreen
+```
+
+* **Recipe 6 Vendor Overlay (`scripts/build_vendor_virgl.py`):** Disables SurfaceFlinger fullscreen Kawase blurs (`ro.surface_flinger.supports_background_blur=0`, `persist.sys.sf.disable_blurs=1`) and `renderengine_gpu_stats`, raises `/vendor/usr/idc/GenericMouse.idc` bounds to `3840x2160` (fixing `1920x1080` clamping), and disables/stops crash-looping hardware services absent in QEMU (`suspend_diagnostics`, `suspend_notification_service`, `storage_metrics_service`, `hal_desktop_charge_control_default`, camera HAL wrappers, `udsattestation`, `timberslide`).
+* **Launcher Tuning (`launcher/launch_googlebook.py`):**
+  * `--input {virtio,tablet,usb}` (default `virtio`): keeps reliable `usb-kbd` while replacing emulated USB mouse polling with direct PCI `virtio-mouse-pci` (or `virtio-tablet-pci`).
+  * `--gpu-hostmem-mb 1024`: increases `virtio-gpu-gl-pci` `max_hostmem` from QEMU's 256 MiB default.
+  * Quiet UART serial console by default (pass `--verbose-console` to restore `earlycon`/`loglevel=8` debugging), eliminating synchronous 8250 UART WHPX VM exits.
+  * Enables `cache=writeback,discard=unmap` on the QCOW2 drive and `ABOVE_NORMAL_PRIORITY_CLASS` on Windows (`--no-high-priority` to disable).
+* **Observed Impact (`2560x1440` VirGL):** Serial UART log output dropped from `28,688` lines (`4.09 MB`) to `503` lines (`69.9 KB`), SurfaceFlinger reported `Disabling blur effects, they are not supported.`, and desktop/cursor latency became significantly smoother.
+* **Write-up & Benchmarks (TR / EN):** See [senkron.tech/googlebook-os/](https://senkron.tech/googlebook-os/) for setup notes, latency diagnostics, and ecosystem references.
+
+
 
 ---
 
@@ -279,6 +301,10 @@ gbos-win-whpx/
 ├── install.ps1               # Automated end-to-end setup script
 
 ├── Start-Googlebook.bat      # Fast launcher batch script
+
+├── Start-Googlebook-VirGL.bat # VirGL host-GPU launcher batch script
+
+├── Start-Googlebook-Smooth.bat # Tuned 1440p VirGL + VirtIO mouse launcher
 
 ├── Start-Googlebook.ps1      # Native PowerShell launcher script
 
@@ -317,6 +343,8 @@ gbos-win-whpx/
 
 
 This work builds upon research and concepts from the open-source community:
+
+* [**ArtemPozharov/gbos-win-whpx**](https://github.com/ArtemPozharov/gbos-win-whpx) (upstream repository) for the Windows WHPX port, `avx_vnni_emu.ko` Alder Lake ISA emulator, SELinux `execmem` patch, `virtio-gpu` true-color fix, and Mesa VirGL integration.
 
 * [**gbrunch**](https://github.com/danbyumagic/gbrunch) by `@danbyumagic` for original x86 recovery analysis, GPT partition layout, and Cuttlefish component grafting.
 
